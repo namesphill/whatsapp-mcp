@@ -12,11 +12,24 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    list_audio_messages as whatsapp_list_audio_messages,
 )
+import json
+import os
+import subprocess
 
 # Initialize FastMCP server
 mcp = FastMCP("whatsapp")
+
+MACPARAKEET_CLI = os.environ.get(
+    "MACPARAKEET_CLI", "/Applications/MacParakeet.app/Contents/MacOS/macparakeet-cli"
+)
+# Transcripts go to this database unless save_to_library is set, so the MacParakeet library
+# doesn't fill up with copies of WhatsApp audio.
+TRANSCRIPTS_DB = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "whatsapp-bridge", "store", "transcripts.db"
+)
 
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:
@@ -245,6 +258,83 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+@mcp.tool()
+def list_audio_messages(chat_jid: str, limit: int = 10, from_me: Optional[bool] = None) -> List[Dict[str, Any]]:
+    """List a chat's audio messages and voice notes, newest first.
+
+    Args:
+        chat_jid: The chat's JID (a phone-number JID or an @lid JID; check both for one person)
+        limit: Maximum number of messages to return (default 10)
+        from_me: True for only audio you sent, False for only audio you received, None for both
+
+    Returns:
+        A list with message_id, timestamp, is_from_me, sender, file_bytes, and approx_minutes
+        (an estimate from the file size; the transcript reports the exact duration)
+    """
+    return whatsapp_list_audio_messages(chat_jid, limit, from_me)
+
+
+@mcp.tool()
+def transcribe_audio_message(
+    message_id: str,
+    chat_jid: str,
+    engine: str = "parakeet",
+    language: Optional[str] = None,
+    save_to_library: bool = False,
+) -> Dict[str, Any]:
+    """Download a WhatsApp audio message and transcribe it locally with MacParakeet.
+
+    Nothing leaves this Mac. Parakeet is fastest; it detects the language itself but can
+    drift into English on fast non-English speech. For non-English audio, Whisper with an
+    explicit language is more accurate.
+
+    Args:
+        message_id: The audio message's ID (from list_audio_messages or list_messages)
+        chat_jid: The JID of the chat that contains the message
+        engine: "parakeet" (default, fastest) or "whisper" (pass language for non-English audio)
+        language: Language code for Whisper, such as "es" or "en". Parakeet ignores it.
+        save_to_library: Also save the transcript to the MacParakeet app's library (default False)
+
+    Returns:
+        success, transcript, duration_seconds, engine, language, and the local audio file_path
+    """
+    if engine not in ("parakeet", "whisper"):
+        return {"success": False, "message": "engine must be 'parakeet' or 'whisper'"}
+    file_path = whatsapp_download_media(message_id, chat_jid)
+    if not file_path:
+        return {"success": False, "message": "Failed to download the audio; is the bridge running?"}
+
+    command = [MACPARAKEET_CLI, "transcribe", file_path, "--engine", engine,
+               "--speaker-detection", "off", "-f", "json"]
+    if engine == "whisper" and language:
+        command += ["--language", language]
+    if not save_to_library:
+        command += ["--database", TRANSCRIPTS_DB]
+    try:
+        run = subprocess.run(
+            command, capture_output=True, text=True, timeout=1800,
+            env={**os.environ, "MACPARAKEET_TELEMETRY": "0"},
+        )
+    except FileNotFoundError:
+        return {"success": False, "message": f"MacParakeet CLI not found at {MACPARAKEET_CLI}"}
+    except subprocess.TimeoutExpired:
+        return {"success": False, "message": "Transcription timed out after 30 minutes"}
+    if run.returncode != 0:
+        return {"success": False, "message": (run.stderr or run.stdout).strip()[-1000:]}
+    try:
+        result = json.loads(run.stdout)
+    except json.JSONDecodeError:
+        return {"success": False, "message": "MacParakeet returned output that isn't JSON"}
+    return {
+        "success": True,
+        "transcript": result.get("rawTranscript", ""),
+        "duration_seconds": round((result.get("durationMs") or 0) / 1000),
+        "engine": f"{result.get('engine')} {result.get('engineVariant')}",
+        "language": result.get("language"),
+        "file_path": file_path,
+    }
+
 
 if __name__ == "__main__":
     # Initialize and run the server

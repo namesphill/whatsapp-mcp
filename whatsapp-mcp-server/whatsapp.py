@@ -782,3 +782,31 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         return None
+
+
+def list_audio_messages(chat_jid: str, limit: int = 10, from_me: Optional[bool] = None) -> List[dict]:
+    """Return the chat's audio messages (voice notes included), newest first."""
+    conn = sqlite3.connect(f"file:{MESSAGES_DB_PATH}?mode=ro", uri=True)
+    try:
+        sql = ("SELECT id, timestamp, is_from_me, sender, file_length FROM messages "
+               "WHERE chat_jid = ? AND media_type = 'audio'")
+        params: list = [chat_jid]
+        if from_me is not None:
+            sql += " AND is_from_me = ?"
+            params.append(1 if from_me else 0)
+        sql += " ORDER BY timestamp DESC LIMIT ?"
+        params.append(limit)
+        return [
+            {
+                "message_id": row[0],
+                "timestamp": row[1],
+                "is_from_me": bool(row[2]),
+                "sender": row[3],
+                "file_bytes": row[4],
+                # WhatsApp voice notes are Opus at roughly 19 kbit/s; a rough guide only.
+                "approx_minutes": round(row[4] * 8 / 19000 / 60, 1) if row[4] else None,
+            }
+            for row in conn.execute(sql, params).fetchall()
+        ]
+    finally:
+        conn.close()
