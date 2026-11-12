@@ -666,10 +666,9 @@ func extractDirectPathFromURL(url string) string {
 		return url // Return original URL if parsing fails
 	}
 
+	// Keep the query string: it carries the CDN auth tokens (oh, oe), and whatsmeow
+	// appends its own parameters with "&", so a path without "?..." gets a 403.
 	pathPart := parts[1]
-
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
 
 	// Create proper direct path format
 	return "/" + pathPart
