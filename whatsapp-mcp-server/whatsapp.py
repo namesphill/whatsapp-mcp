@@ -8,6 +8,7 @@ import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+WHATSAPP_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
 
 @dataclass
@@ -391,38 +392,54 @@ def list_chats(
 
 
 def search_contacts(query: str) -> List[Contact]:
-    """Search contacts by name or phone number."""
+    """Search contacts by name, saved contact name, phone number, or LID."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = sqlite3.connect(f"file:{MESSAGES_DB_PATH}?mode=ro", uri=True)
         cursor = conn.cursor()
-        
-        # Split query into characters to support partial matching
-        search_pattern = '%' +query + '%'
-        
+        search_pattern = '%' + query + '%'
+
+        if not os.path.exists(WHATSAPP_DB_PATH):
+            cursor.execute("""
+                SELECT DISTINCT jid, name FROM chats
+                WHERE (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
+                  AND jid NOT LIKE '%@g.us'
+                ORDER BY name, jid LIMIT 50
+            """, (search_pattern, search_pattern))
+            return [Contact(phone_number=j.split('@')[0], name=n, jid=j) for j, n in cursor.fetchall()]
+
+        # The bridge's session DB holds the phone<->LID map and the names saved on
+        # the phone; without it, LID-keyed chats and saved names are unsearchable.
+        cursor.execute("ATTACH DATABASE ? AS wa", (f"file:{WHATSAPP_DB_PATH}?mode=ro",))
         cursor.execute("""
-            SELECT DISTINCT 
-                jid,
-                name
-            FROM chats
-            WHERE 
-                (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
-                AND jid NOT LIKE '%@g.us'
-            ORDER BY name, jid
-            LIMIT 50
-        """, (search_pattern, search_pattern))
-        
-        contacts = cursor.fetchall()
-        
-        result = []
-        for contact_data in contacts:
-            contact = Contact(
-                phone_number=contact_data[0].split('@')[0],
-                name=contact_data[1],
-                jid=contact_data[0]
+            WITH people AS (
+                SELECT substr(their_jid, 1, instr(their_jid, '@') - 1) AS user,
+                       MAX(COALESCE(NULLIF(full_name, ''), NULLIF(first_name, ''),
+                                    NULLIF(push_name, ''), NULLIF(business_name, ''))) AS saved_name
+                FROM wa.whatsmeow_contacts GROUP BY user
+            ),
+            direct AS (
+                SELECT c.jid, c.name,
+                       substr(c.jid, 1, instr(c.jid, '@') - 1) AS user,
+                       COALESCE(m1.pn, m2.pn) AS pn
+                FROM chats c
+                LEFT JOIN wa.whatsmeow_lid_map m1 ON c.jid = m1.lid || '@lid'
+                LEFT JOIN wa.whatsmeow_lid_map m2 ON c.jid = m2.pn || '@s.whatsapp.net'
+                WHERE c.jid NOT LIKE '%@g.us'
             )
-            result.append(contact)
-            
-        return result
+            SELECT d.jid,
+                   COALESCE(p1.saved_name, p2.saved_name, d.name) AS name,
+                   COALESCE(d.pn, d.user) AS phone
+            FROM direct d
+            LEFT JOIN people p1 ON p1.user = d.user
+            LEFT JOIN people p2 ON p2.user = d.pn
+            WHERE LOWER(d.jid) LIKE LOWER(:q) OR LOWER(COALESCE(d.pn, '')) LIKE LOWER(:q)
+               OR LOWER(COALESCE(d.name, '')) LIKE LOWER(:q)
+               OR LOWER(COALESCE(p1.saved_name, '')) LIKE LOWER(:q)
+               OR LOWER(COALESCE(p2.saved_name, '')) LIKE LOWER(:q)
+            ORDER BY name, d.jid
+            LIMIT 50
+        """, {"q": search_pattern})
+        return [Contact(phone_number=phone, name=name, jid=jid) for jid, name, phone in cursor.fetchall()]
         
     except sqlite3.Error as e:
         print(f"Database error: {e}")
