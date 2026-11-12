@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -553,6 +554,19 @@ func (d *MediaDownloader) GetMediaType() whatsmeow.MediaType {
 	return d.MediaType
 }
 
+var unsafePathChars = regexp.MustCompile(`[^A-Za-z0-9._@-]`)
+
+// safePathComponent turns a sender-controlled string into a single safe filename:
+// no separators, no "..", and no leading dot.
+func safePathComponent(s string) string {
+	s = unsafePathChars.ReplaceAllString(filepath.Base(s), "_")
+	s = strings.TrimLeft(s, ".")
+	if s == "" {
+		s = "_"
+	}
+	return s
+}
+
 // Function to download media from a message
 func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) (bool, string, string, string, error) {
 	// Query the database for the message
@@ -562,7 +576,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var err error
 
 	// First, check if we already have this file
-	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
+	chatDir := filepath.Join("store", safePathComponent(chatJID))
 	localPath := ""
 
 	// Get media info from the database
@@ -593,8 +607,13 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	// Generate a local path for the file. Stored filenames come from the time a message was
 	// saved, to the second, so history sync gives many messages the same name; the message ID
 	// keeps each download in its own file.
-	filename = fmt.Sprintf("%s_%s", messageID, filename)
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
+	// The message ID and a document's filename come from the sender, so neither may steer
+	// the path outside the chat's directory.
+	filename = safePathComponent(messageID) + "_" + safePathComponent(filename)
+	localPath = filepath.Join(chatDir, filename)
+	if rel, err := filepath.Rel(chatDir, localPath); err != nil || rel != filename {
+		return false, "", "", "", fmt.Errorf("refusing unsafe media path")
+	}
 
 	// Get absolute path
 	absPath, err := filepath.Abs(localPath)
